@@ -97,38 +97,51 @@
             const heading = Math.random() * 360; // Random direction
 
             // Clear previous route
-            directionsRenderer.setDirections({routes: []});
+            directionsRenderer.setDirections({ routes: [] });
             document.getElementById('export').disabled = true;
 
             const targetMeters = isLoop ? desiredMeters / 2 : desiredMeters;
-            findDestinationForDistance(targetMeters, heading, isLoop, desiredMeters);
+            findDestinationForDistance(targetMeters, heading, isLoop, desiredMeters, 0);
         }
 
-        function findDestinationForDistance(targetMeters, heading, isLoop, desiredMeters) {
+        function findDestinationForDistance(targetMeters, heading, isLoop, desiredMeters, retryCount) {
+            const maxRetries = 5; // Limit retries to avoid infinite loops
             let low = 0;
-            let high = targetMeters * 2; // Increased to allow longer routes
-            let iterations = 20;
+            let high = targetMeters * 2; // Allow longer routes for flexibility
+            let iterations = 30; // Increased for precision
             let bestDiff = Infinity;
             let bestResponse = null;
+            const tolerance = 50; // Acceptable distance difference in meters
 
             function iterate() {
-                if (iterations-- <= 0) {
+                if (iterations-- <= 0 || (bestResponse && bestDiff <= tolerance)) {
                     if (bestResponse) {
+                        const selectedRoute = bestResponse.routes[bestResponse.selectedIndex || 0];
+                        let routeDist = 0;
+                        selectedRoute.legs.forEach(leg => routeDist += leg.distance.value);
+                        console.log(`Final route distance: ${(routeDist / 1000).toFixed(2)} km (desired: ${desiredMeters / 1000} km, diff: ${(bestDiff / 1000).toFixed(2)} km)`);
                         displayRoute(bestResponse);
+                    } else if (retryCount < maxRetries) {
+                        // Retry with a new heading if no valid route found
+                        console.warn(`No valid route found, retrying with new heading (${retryCount + 1}/${maxRetries})`);
+                        const newHeading = (heading + 90) % 360; // Try a different direction
+                        findDestinationForDistance(targetMeters, newHeading, isLoop, desiredMeters, retryCount + 1);
                     } else {
-                        alert('Could not generate a route. Try again.');
+                        alert('Could not generate a suitable running route without ferries. Try a different distance or location.');
                     }
                     return;
                 }
 
                 const mid = (low + high) / 2;
                 const dest = google.maps.geometry.spherical.computeOffset(startLatLng, mid, heading);
-                console.log('Computed destination:', {lat: dest.lat(), lng: dest.lng()}); // Debug
+                console.log('Computed destination:', { lat: dest.lat(), lng: dest.lng() });
 
                 const request = {
                     origin: startLatLng,
                     travelMode: 'WALKING',
-                    provideRouteAlternatives: isLoop
+                    provideRouteAlternatives: true,
+                    avoidHighways: true,
+                    avoidFerries: true,
                 };
 
                 if (isLoop) {
@@ -139,47 +152,70 @@
                     request.destination = dest;
                 }
 
-                console.log('Route Request for iteration:', {
-                    origin: {lat: startLatLng.lat(), lng: startLatLng.lng()},
-                    destination: isLoop ? {lat: startLatLng.lat(), lng: startLatLng.lng()} : {lat: dest.lat(), lng: dest.lng()},
-                    waypoints: request.waypoints ? request.waypoints.map(wp => ({lat: wp.location.lat(), lng: wp.location.lng()})) : [],
+                console.log('Route Request:', {
+                    origin: { lat: startLatLng.lat(), lng: startLatLng.lng() },
+                    destination: isLoop ? { lat: startLatLng.lat(), lng: startLatLng.lng() } : { lat: dest.lat(), lng: dest.lng() },
+                    waypoints: request.waypoints ? request.waypoints.map(wp => ({ lat: wp.location.lat(), lng: wp.location.lng() })) : [],
                     travelMode: request.travelMode,
-                    provideRouteAlternatives: request.provideRouteAlternatives
-                }); // Debug
+                    avoidHighways: request.avoidHighways,
+                    avoidFerries: request.avoidFerries
+                });
 
                 directionsService.route(request, (response, status) => {
                     if (status === 'OK') {
-                        let routeDist = 0;
-                        response.routes[0].legs.forEach(leg => routeDist += leg.distance.value);
-
-                        let diff = Math.abs(routeDist - desiredMeters);
                         let selectedIndex = 0;
+                        let routeDist = 0;
+                        let hasFerry = false;
 
-                        if (isLoop && response.routes.length > 1) {
-                            for (let i = 1; i < response.routes.length; i++) {
-                                let altDist = 0;
-                                response.routes[i].legs.forEach(leg => altDist += leg.distance.value);
+                        // Check all routes for distance and ferry usage
+                        for (let i = 0; i < response.routes.length; i++) {
+                            let altDist = 0;
+                            let routeHasFerry = false;
+                            response.routes[i].legs.forEach(leg => {
+                                altDist += leg.distance.value;
+                                // Check for ferry in step instructions
+                                leg.steps.forEach(step => {
+                                    if (step.instructions.toLowerCase().includes('ferry') || step.instructions.toLowerCase().includes('boat')) {
+                                        routeHasFerry = true;
+                                    }
+                                });
+                            });
+
+                            if (!routeHasFerry) {
                                 const altDiff = Math.abs(altDist - desiredMeters);
-                                if (altDiff < diff) {
-                                    diff = altDiff;
+                                if (altDiff < bestDiff) {
+                                    bestDiff = altDiff;
                                     selectedIndex = i;
+                                    routeDist = altDist;
+                                    bestResponse = response;
+                                    bestResponse.selectedIndex = selectedIndex;
                                 }
+                            } else {
+                                console.warn(`Route ${i} rejected due to ferry usage.`);
+                                hasFerry = true;
                             }
                         }
 
-                        if (diff < bestDiff) {
-                            bestDiff = diff;
-                            bestResponse = response;
-                            bestResponse.selectedIndex = selectedIndex;
-                        }
-
-                        if (routeDist > desiredMeters) {
-                            high = mid;
+                        if (bestResponse) {
+                            console.log(`Route ${selectedIndex} selected, distance: ${(routeDist / 1000).toFixed(2)} km, diff: ${(bestDiff / 1000).toFixed(2)} km`);
+                            // Adjust binary search bounds based on total distance
+                            if (routeDist > desiredMeters + tolerance) {
+                                high = mid;
+                            } else if (routeDist < desiredMeters - tolerance) {
+                                low = mid;
+                            } else {
+                                iterations = 0; // Stop if within tolerance
+                            }
+                        } else if (hasFerry && retryCount < maxRetries) {
+                            console.warn(`All routes contain ferries, retrying with new heading (${retryCount + 1}/${maxRetries})`);
+                            const newHeading = (heading + 90) % 360;
+                            findDestinationForDistance(targetMeters, newHeading, isLoop, desiredMeters, retryCount + 1);
+                            return;
                         } else {
-                            low = mid;
+                            high = mid; // Try a shorter distance
                         }
                     } else {
-                        console.warn('Directions API error:', status); // Debug
+                        console.warn('Directions API error:', status);
                         high = mid;
                     }
 
@@ -214,8 +250,8 @@
                 destination: req.destination ? (req.destination.location ? {lat: req.destination.location.lat(), lng: req.destination.location.lng()} : req.destination.lat ? {lat: req.destination.lat(), lng: req.destination.lng()} : 'invalid') : 'undefined',
                 waypoints: req.waypoints ? req.waypoints.map(wp => wp.location.lat ? {lat: wp.location.lat(), lng: wp.location.lng()} : 'invalid') : [],
                 travelMode: req.travelMode
-            }); // Debug
-            console.log('Selected Route overview_path length:', selectedRoute.overview_path.length); // Debug
+            });
+            console.log('Selected Route overview_path length:', selectedRoute.overview_path.length);
 
             let url = 'https://www.google.com/maps/dir/?api=1&travelmode=walking';
             
@@ -229,7 +265,7 @@
                 origin = `${startLatLng.lat()},${startLatLng.lng()}`;
             }
             url += '&origin=' + encodeURIComponent(origin);
-            console.log('Origin:', origin); // Debug
+            console.log('Origin:', origin);
 
             // Determine if it's a loop route
             const isLoop = req.destination && (
@@ -250,12 +286,12 @@
                         try {
                             let wpLocation = wp.location;
                             if (wp.location && wp.location.location && typeof wp.location.location.lat === 'function') {
-                                wpLocation = wp.location.location; // Handle nested location
+                                wpLocation = wp.location.location;
                             }
                             if (wpLocation && typeof wpLocation.lat === 'function') {
                                 const lat = wpLocation.lat();
                                 const lng = wpLocation.lng();
-                                console.log(`Waypoint ${index} coordinates: ${lat},${lng}`); // Debug
+                                console.log(`Waypoint ${index} coordinates: ${lat},${lng}`);
                                 return `${lat},${lng}`;
                             } else {
                                 console.warn(`Invalid waypoint location at index ${index}:`, wp.location);
@@ -276,13 +312,13 @@
                 const midIndex = Math.floor(path.length / 2);
                 const midPoint = path[midIndex];
                 waypoints = `${midPoint.lat()},${midPoint.lng()}`;
-                console.log('Using middle point as waypoint:', waypoints); // Debug
+                console.log('Using middle point as waypoint:', waypoints);
             }
             
             if (waypoints) {
                 url += '&waypoints=' + encodeURIComponent(waypoints);
             }
-            console.log('Waypoints:', waypoints); // Debug
+            console.log('Waypoints:', waypoints);
 
             // Add destination
             let destination;
@@ -297,15 +333,14 @@
                 destination = `${lastLeg.end_location.lat()},${lastLeg.end_location.lng()}`;
             }
             url += '&destination=' + encodeURIComponent(destination);
-            console.log('Destination:', destination); // Debug
+            console.log('Destination:', destination);
 
-            console.log('Generated Google Maps URL:', url); // Debug
+            console.log('Generated Google Maps URL:', url);
             window.open(url, '_blank');
         }
     </script>
     <script async defer
         src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDoUyqnOG9WxIo9jbb_-2VydygCyoyCSwk&libraries=geometry&callback=initMap">
     </script>
-    </body>
-
+</body>
 </html>
